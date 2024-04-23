@@ -1,0 +1,199 @@
+# Subscriber Configuration Code
+# Publishes the Public Key
+# Subscribes to ciphertext
+# Subscribes to secret/message
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import padding
+
+import paho.mqtt.client as mqtt
+from ctypes import CDLL
+import base64
+import hashlib
+import time
+
+from implement import (
+    generate_keypair_768,
+    encrypt_768,
+    decrypt_768,
+    CRYPTO_PUBLICKEYBYTES_768,
+    CRYPTO_SECRETKEYBYTES_768,
+    CRYPTO_CIPHERTEXTBYTES_768,
+    CRYPTO_BYTES_768
+)
+
+# Load the Kyber shared library
+kyber = CDLL('./libpqcrystals_kyber768_ref.so')
+
+# Capture device ID from user input
+device_id = input("Enter the device ID: ")
+ciphertext_topic = f"ciphertext/{device_id}"
+secret_message_topic = f"secret/message/{device_id}"
+
+# Global variable to store shared secret
+shared_secret = None
+
+# Generate the public and private keys
+class KeyManager:
+    def __init__(self):
+        # Generate key pair
+        self.public_key, self.private_key = generate_keypair_768()
+
+    def get_public_key_encoded(self):
+        # Return the public key encoded in base64 for transmission
+        return base64.b64encode(self.public_key).decode('utf-8')
+
+    def get_private_key(self):
+        # Return the private key for internal use
+        return self.private_key
+key_manager = KeyManager()
+
+# MQTT Broker settings
+MQTT_BROKER = "localhost"
+MQTT_PORT = 1883  
+MQTT_KEEPALIVE_INTERVAL = 60 
+
+# Callback when client receives a CONNACK response from the server.
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Connected successfully to the broker.")
+        # Subscribe to topics once connected. Dynamic based on Device ID.
+        client.subscribe(ciphertext_topic, qos=1)
+        client.subscribe(secret_message_topic, qos=1)
+
+        # Once connected, publish the public key
+        topic = f"public_keys/{device_id}"
+        public_key_encoded = key_manager.get_public_key_encoded()
+        publish_message(client, topic, public_key_encoded, qos=1)
+    else:
+        print(f"Failed to connect, return code {rc}\n")
+
+# Callback when client disconnects from the broker.
+def on_disconnect(client, userdata, rc):
+    if rc != 0:
+        print("Unexpected disconnection.")
+
+# Callback when a PUBLISH message is received from the server.
+def on_message(client, userdata, msg):
+    global shared_secret
+    # When Ciphertext is published, it is encoded and stord in global variable.
+    if msg.topic == ciphertext_topic:
+        print(f"Received ciphertext on {ciphertext_topic}")
+        # Decode the payload from base64 to binary
+        try:
+            ciphertext = base64.b64decode(msg.payload)
+        except Exception as e:
+            print(f"Failed to decode base64 ciphertext: {e}")
+            return
+
+        # Decrypt ciphertext using the private key from KeyManager
+        private_key = key_manager.get_private_key()  
+        shared_secret = decrypt_768(ciphertext, private_key)
+        if shared_secret:
+            print("Shared secret successfully decrypted and stored.")
+        else:
+            print("Failed to decrypt shared secret.")
+    elif msg.topic == secret_message_topic:
+        print(f"Received encrypted message on {msg.topic}")
+        try:
+            # Decode the payload from base64 encoding
+            encrypted_message = base64.b64decode(msg.payload)
+            print("Decoded encrypted message from base64.")
+
+            # Decrypt the message using AES with the shared secret
+            decrypted_message = decrypt_aes(encrypted_message, shared_secret)
+            # Assuming the decrypted_message is in bytes, convert it to a string
+            plaintext = decrypted_message.decode('utf-8')
+            print(f"Decrypted message: {plaintext}")
+        except Exception as e:
+            print(f"Failed to decode or decrypt message: {e}")
+
+    # Log all received messages (for debugging, you may want to disable this in production)
+    try:
+        print(f"Received message '{msg.payload.decode()}' on topic '{msg.topic}' with QoS {msg.qos}")
+    except Exception as e:
+        print("Error decoding message payload for logging.")
+
+
+def decrypt_aes(ciphertext, shared_secret):
+    # Hash the shared secret to get the AES key
+    key = hash_shared_secret(shared_secret)
+
+    # Assume the IV is prepended to the ciphertext
+    iv, actual_ciphertext = ciphertext[:16], ciphertext[16:]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_plaintext = decryptor.update(actual_ciphertext) + decryptor.finalize()
+
+    # Unpad the plaintext
+    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+    plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
+
+    return plaintext
+
+# Hash the shared secret using SHA-256
+def hash_shared_secret(shared_secret):
+    sha256 = hashlib.sha256()
+    sha256.update(shared_secret)  
+    hashed_secret = sha256.digest()[:16]  # Take the first 16 bytes for AES-128
+    return hashed_secret
+
+# Publish a message
+def publish_message(client, topic, message, qos=1):
+    result = client.publish(topic, message, qos=qos)
+    # result: [result_code, message_id]
+    if result[0] == mqtt.MQTT_ERR_SUCCESS:
+        print(f"Message sent to {topic}")
+    else:
+        print("Failed to send message")
+
+# Callback when a message has been published.
+def on_publish(client, userdata, mid):
+    print(f"Message published with mid {mid}")
+
+# Setup the client
+client = mqtt.Client()
+client.on_connect = on_connect
+client.on_disconnect = on_disconnect
+client.on_message = on_message
+client.on_publish = on_publish
+
+# Enable TLS for secure connection
+#client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS)
+#client.tls_insecure_set(False)  # True if the broker's certificate is not verified
+
+# Set credentials if required
+#client.username_pw_set("username", "password")
+
+# Handle reconnection outside of loop_forever()
+def start_loop():
+    while True:
+        try:
+            client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
+            # Network loop runs forever and handles reconnecting.
+            client.loop_forever()
+        except KeyboardInterrupt:
+            print("Exiting")
+            client.disconnect()
+            break
+        except:
+            print("Unexpected error. Trying to reconnect.")
+            time.sleep(5)
+
+def main():
+    global key_manager, shared_secret, client  # Include the global client variable
+
+    key_manager = KeyManager()
+    shared_secret = None
+
+    # Remove the redeclaration of client
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
+    client.loop_forever()
+
+if __name__ == "__main__":
+    main()
+

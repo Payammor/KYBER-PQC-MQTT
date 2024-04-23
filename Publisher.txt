@@ -1,0 +1,187 @@
+# Publisher Configuration Code
+# Publishes the ciphertext
+# Publisher the secret_message
+# Subscribes to public_key
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import padding
+
+import paho.mqtt.client as mqtt
+from ctypes import CDLL
+import base64
+import hashlib
+import os
+import time
+
+from implement import (
+    generate_keypair_768,
+    encrypt_768,
+    decrypt_768,
+    CRYPTO_PUBLICKEYBYTES_768,
+    CRYPTO_SECRETKEYBYTES_768,
+    CRYPTO_CIPHERTEXTBYTES_768,
+    CRYPTO_BYTES_768
+)
+
+# Load the Kyber shared library
+kyber = CDLL('./libpqcrystals_kyber768_ref.so')
+
+# Capture device ID from user input
+device_id = input("Enter the device ID: ")
+public_key_topic = f"public_keys/{device_id}"
+
+received_public_key = None
+received_ciphertext = None
+received_shared_secret = None
+
+
+# Callback when client receives a CONNACK response from the server.
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Connected successfully to the broker.")
+        # Subscribe to topics once connected. Dynamic based on Device ID.
+        client.subscribe(public_key_topic, qos=1)
+    else:
+        print(f"Failed to connect, return code {rc}\n")
+
+# Callback when client disconnects from the broker.
+def on_disconnect(client, userdata, rc):
+    if rc != 0:
+        print("Unexpected disconnection.")
+
+import base64
+
+def on_message(client, userdata, msg):
+    global received_ciphertext, received_shared_secret
+    if msg.topic == f"public_keys/{device_id}":
+        print(f"Received message on topic {msg.topic}")
+        try:
+            # Decode the public key
+            public_key = decode_public_key(msg.payload)
+            print("Public key decoded successfully.")
+            
+            # Encrypt the public key to generate ciphertext and shared secret
+            received_ciphertext, received_shared_secret = encrypt_768(public_key)
+            print("Public key encrypted successfully.")
+            print(f"Ciphertext: {bytes(received_ciphertext)}")
+            print(f"Shared Secret: {bytes(received_shared_secret)}")
+            
+            # Publish the ciphertext to the appropriate topic
+            publish_ciphertext(client, device_id, received_ciphertext)
+
+            # After publishing the ciphertext, publish a secret message
+            secret_message_topic = f"secret/message/{device_id}"
+            publish_encrypted_message(client, secret_message_topic, "Kill the Queen in CUD", received_shared_secret)
+
+
+        except ValueError as e:
+            print(f"Decoding error: {e}")
+        except EncryptionError as e:
+            print(f"Encryption error: {e}")
+        except Exception as e:
+            print(f"Unhandled error: {e}")
+
+
+def decode_public_key(encoded_key):
+    """ Decode the base64 encoded public key. """
+    try:
+        return base64.b64decode(encoded_key)
+    except base64.binascii.Error as e:
+        raise ValueError("Base64 decoding failed") from e
+
+class EncryptionError(Exception):
+    """ Custom exception for encryption errors. """
+    pass
+
+def publish_ciphertext(client, device_id, ciphertext):
+    # Define the topic based on the device ID
+    ciphertext_topic = f"ciphertext/{device_id}"
+    
+    # Publish the ciphertext encoded in base64 to ensure it is transmitted correctly over MQTT
+    encoded_ciphertext = base64.b64encode(ciphertext).decode('utf-8')
+    
+    # Publish the encoded ciphertext
+    result = client.publish(ciphertext_topic, encoded_ciphertext, qos=1)
+    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+        print(f"Ciphertext successfully published to {ciphertext_topic}")
+    else:
+        print(f"Failed to publish ciphertext: {result.rc}")
+
+def encrypt_message(message, key):
+    """ Encrypt the message using AES with the given key. """
+    # Padding the message to ensure it is a multiple of the block size
+    padder = padding.PKCS7(algorithms.AES.block_size).padder()
+    padded_data = padder.update(message.encode()) + padder.finalize()
+
+    # Generating a random IV for AES encryption
+    iv = os.urandom(16)
+
+    # Encrypting the message
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
+
+    # Returning the IV with the encrypted message (IV is needed for decryption)
+    return iv + encrypted
+
+def publish_encrypted_message(client, topic, message, shared_secret):
+    """ Encrypt and publish the message to the given MQTT topic. """
+    # Hashing the shared secret to create an AES key
+    aes_key = hash_shared_secret(shared_secret)
+
+    # Encrypting the message
+    encrypted_message = encrypt_message(message, aes_key)
+
+    # Encoding the encrypted message in base64
+    encoded_message = base64.b64encode(encrypted_message).decode('utf-8')
+
+    # Publishing the encoded, encrypted message
+    result = client.publish(topic, encoded_message, qos=1)
+    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+        print(f"Encrypted message successfully published to {topic}")
+    else:
+        print(f"Failed to publish encrypted message: {result.rc}")
+
+def hash_shared_secret(shared_secret):
+    """ Hash the shared secret to produce an AES key. """
+    # Using SHA-256 hash function and then slicing to get the first 16 bytes for AES-128 key
+    hashed = hashlib.sha256(shared_secret).digest()[:16]
+    return hashed
+
+
+def start_loop(client, broker, port, keepalive):
+    """Handles reconnection and maintains the MQTT loop."""
+    while True:
+        try:
+            print("Connecting to MQTT Broker...")
+            client.connect(broker, port, keepalive)
+            client.loop_forever()
+        except KeyboardInterrupt:
+            print("Exiting")
+            client.disconnect()
+            break
+        except Exception as e:
+            print(f"Unexpected error: {e}. Trying to reconnect.")
+            time.sleep(5)
+
+def main():
+    global received_ciphertext, received_shared_secret  # Ensure these are defined at the top
+
+    # Initialize the MQTT client
+    client = mqtt.Client()
+
+    # Assign MQTT callbacks
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    # MQTT Broker settings
+    MQTT_BROKER = "localhost"
+    MQTT_PORT = 1883  
+    MQTT_KEEPALIVE_INTERVAL = 60 
+
+    # Start the connection handling loop
+    start_loop(client, MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+import ctypes
+
+# Constants for kyber768
+CRYPTO_SECRETKEYBYTES_768 = 2400
+CRYPTO_PUBLICKEYBYTES_768 = 1184
+CRYPTO_CIPHERTEXTBYTES_768 = 1088
+CRYPTO_BYTES_768 = 32
+
+# Load the Kyber768 shared library
+kyber_lib = ctypes.CDLL('/home/gp2/kyber/ref/libpqcrystals_kyber768_ref.so')
+
+# Assign the correct symbol names from the shared library
+kyber_lib.pqcrystals_kyber768_ref_keypair.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte)]
+kyber_lib.pqcrystals_kyber768_ref_keypair.restype = ctypes.c_int
+
+kyber_lib.pqcrystals_kyber768_ref_enc.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte)]
+kyber_lib.pqcrystals_kyber768_ref_enc.restype = ctypes.c_int
+
+kyber_lib.pqcrystals_kyber768_ref_dec.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte)]
+kyber_lib.pqcrystals_kyber768_ref_dec.restype = ctypes.c_int
+
+# Now the functions use the correct symbol names
+def generate_keypair_768():
+    public_key = (ctypes.c_ubyte * CRYPTO_PUBLICKEYBYTES_768)()
+    private_key = (ctypes.c_ubyte * CRYPTO_SECRETKEYBYTES_768)()
+    result = kyber_lib.pqcrystals_kyber768_ref_keypair(public_key, private_key)
+    if result == 0:
+        return bytes(public_key), bytes(private_key)
+    else:
+        raise Exception("Key generation failed for kyber768")
+
+def encrypt_768(public_key):
+    public_key_bytes = (ctypes.c_ubyte * CRYPTO_PUBLICKEYBYTES_768)(*public_key)
+    ciphertext = (ctypes.c_ubyte * CRYPTO_CIPHERTEXTBYTES_768)()
+    shared_secret = (ctypes.c_ubyte * CRYPTO_BYTES_768)()
+    result = kyber_lib.pqcrystals_kyber768_ref_enc(ciphertext, shared_secret, public_key_bytes)
+    if result == 0:
+        return bytes(ciphertext), bytes(shared_secret)
+    else:
+        raise Exception("Encryption failed for kyber768")
+
+def decrypt_768(ciphertext, private_key):
+    private_key_bytes = (ctypes.c_ubyte * CRYPTO_SECRETKEYBYTES_768)(*private_key)
+    ciphertext_bytes = (ctypes.c_ubyte * CRYPTO_CIPHERTEXTBYTES_768)(*ciphertext)
+    shared_secret = (ctypes.c_ubyte * CRYPTO_BYTES_768)()
+    result = kyber_lib.pqcrystals_kyber768_ref_dec(shared_secret, ciphertext_bytes, private_key_bytes)
+    if result == 0:
+        return bytes(shared_secret)
+    else:
+        raise Exception("Decryption failed for kyber768")
